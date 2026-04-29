@@ -1,0 +1,78 @@
+name: PII Scanner
+description: Scan changed files for PII using openai/privacy-filter. Runs locally on the runner — no data leaves the machine.
+author: hholen
+
+inputs:
+  threshold:
+    description: Confidence threshold for blocking (0.0 to 1.0)
+    required: false
+    default: "0.8"
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 22
+
+    - name: Cache HuggingFace model
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/huggingface
+        key: hf-privacy-filter-q4
+
+    - name: Install scanner dependencies
+      shell: bash
+      run: npm ci --prefix "${{ github.action_path }}"
+
+    - name: Get changed files
+      id: changed
+      shell: bash
+      env:
+        EVENT_NAME: ${{ github.event_name }}
+        BASE_REF: ${{ github.base_ref }}
+      run: |
+        if [ "$EVENT_NAME" = "pull_request" ]; then
+          FILES=$(git diff --name-only "origin/$BASE_REF"...HEAD)
+        else
+          FILES=$(git diff --name-only HEAD~1...HEAD 2>/dev/null || echo "")
+        fi
+        echo "$FILES" > /tmp/pii-changed-files.txt
+        COUNT=$(echo "$FILES" | grep -c '[^[:space:]]' || true)
+        echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+        echo "Found $COUNT changed files to check"
+
+    - name: Scan for PII
+      if: steps.changed.outputs.count != '0'
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        BLOCK_THRESHOLD: ${{ inputs.threshold }}
+      run: |
+        EXIT=0
+        while IFS= read -r file; do
+          [ -z "$file" ] && continue
+          [ ! -f "$file" ] && continue
+
+          EXT="${file##*.}"
+          case "$EXT" in
+            ts|tsx|js|jsx|py|json|yaml|yml|md|env|toml|cfg|ini|html|css|sql|sh) ;;
+            *) continue ;;
+          esac
+
+          case "$file" in
+            */node_modules/*|*/package-lock.json|*/yarn.lock|*/pnpm-lock.yaml) continue ;;
+          esac
+
+          echo "Scanning $file..."
+          if ! npx --prefix "$ACTION_PATH" tsx "$ACTION_PATH/src/check-push.ts" "$file"; then
+            EXIT=2
+          fi
+        done < /tmp/pii-changed-files.txt
+
+        if [ "$EXIT" -ne 0 ]; then
+          echo ""
+          echo "::error::PII detected in changed files. See scan output above for details."
+          exit 1
+        fi
+        echo "✓ No PII found in changed files."
